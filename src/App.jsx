@@ -153,37 +153,13 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Start microphone listening session with fresh SpeechRecognition instance & real audio meter
+  // Start microphone listening session with clean, direct SpeechRecognition (no device contention)
   const startListeningSession = () => {
     const SpeechRecognition = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
 
-    // 1. Hook real Web Audio API for responsive visualizer
-    if (typeof navigator !== 'undefined' && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        mediaStreamRef.current = stream;
-        try {
-          const AudioContext = window.AudioContext || window.webkitAudioContext;
-          if (AudioContext) {
-            const ctx = new AudioContext();
-            audioContextRef.current = ctx;
-            const source = ctx.createMediaStreamSource(stream);
-            const analyser = ctx.createAnalyser();
-            analyser.fftSize = 64;
-            source.connect(analyser);
-            analyserRef.current = analyser;
-          }
-        } catch (e) {
-          console.warn('AudioContext error:', e);
-        }
-      }).catch(err => {
-        console.warn('Microphone permission check:', err);
-      });
-    }
-
     if (!SpeechRecognition) {
-      setIsListening(true);
-      isListeningRef.current = true;
-      setMicStatusText('🎙️ Microphone active. Speech API unavailable in this browser; you can also type below.');
+      alert('Speech recognition is not supported in this browser. Please open in Google Chrome or Microsoft Edge.');
+      setMicStatusText('Speech recognition requires Chrome or Edge. You can also type orders below.');
       return;
     }
 
@@ -193,7 +169,6 @@ export default function App() {
       recognitionInstanceRef.current = null;
     }
 
-    // Create fresh instance each time to prevent Chromium dead-instance bug
     try {
       const rec = new SpeechRecognition();
       rec.continuous = true;
@@ -204,7 +179,7 @@ export default function App() {
       rec.onstart = () => {
         setIsListening(true);
         isListeningRef.current = true;
-        setMicStatusText('🎙️ Listening... Speak your order clearly');
+        setMicStatusText('🎙️ Listening... Speak your order now (e.g. "I want 2 lattes")');
         if (synthRef.current && synthRef.current.speaking) {
           synthRef.current.cancel();
           setIsSpeaking(false);
@@ -213,35 +188,35 @@ export default function App() {
 
       rec.onresult = (event) => {
         let interim = '';
-        let final = '';
-        for (let i = 0; i < event.results.length; i++) {
-          const result = event.results[i];
-          if (result.isFinal) {
-            final += result[0].transcript + ' ';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            finalTranscriptRef.current += event.results[i][0].transcript + ' ';
           } else {
-            interim += result[0].transcript;
+            interim += event.results[i][0].transcript;
           }
         }
 
-        const combined = (final + interim).trim();
-        if (combined) {
-          finalTranscriptRef.current = combined;
-          setTranscript(combined);
-          setMicStatusText(`Hearing: "${combined.slice(-40)}"`);
+        const currentText = (finalTranscriptRef.current + ' ' + interim).trim();
+        if (currentText) {
+          setTranscript(currentText);
+          setMicStatusText(`Hearing you: "${currentText.slice(-35)}"`);
         }
       };
 
       rec.onerror = (e) => {
         console.warn('SpeechRecognition error:', e.error);
-        if (e.error === 'no-speech') return;
+        if (e.error === 'no-speech') {
+          // Normal brief silence, keep listening
+          return;
+        }
         if (e.error === 'not-allowed') {
-          setMicStatusText('⚠️ Mic blocked. Click lock/mic icon in browser URL bar to allow.');
+          setMicStatusText('⚠️ Microphone permission denied. Click the lock/mic icon in the address bar to Allow.');
           setIsListening(false);
           isListeningRef.current = false;
           return;
         }
-        // Auto-reconnect if temporary disconnect
-        if (isListeningRef.current && (e.error === 'network' || e.error === 'aborted')) {
+        if (e.error === 'network') {
+          setMicStatusText('⚠️ Speech network timeout. Auto-reconnecting...');
           setTimeout(() => {
             if (isListeningRef.current) startListeningSession();
           }, 300);
@@ -249,14 +224,13 @@ export default function App() {
       };
 
       rec.onend = () => {
-        // If user is still recording, auto-respawn fresh instance immediately
+        // If user is still recording, auto-restart immediately
         if (isListeningRef.current) {
           setTimeout(() => {
             if (isListeningRef.current) startListeningSession();
-          }, 200);
+          }, 150);
         } else {
           setIsListening(false);
-          setMicStatusText('');
         }
       };
 
@@ -264,6 +238,10 @@ export default function App() {
       recognitionInstanceRef.current = rec;
     } catch (err) {
       console.warn('Recognition start exception:', err);
+      // If already started error, force clean and re-start
+      setTimeout(() => {
+        if (isListeningRef.current) startListeningSession();
+      }, 200);
     }
   };
 
@@ -275,17 +253,6 @@ export default function App() {
     if (recognitionInstanceRef.current) {
       try { recognitionInstanceRef.current.stop(); } catch {}
       recognitionInstanceRef.current = null;
-    }
-
-    if (mediaStreamRef.current) {
-      try {
-        mediaStreamRef.current.getTracks().forEach(t => t.stop());
-      } catch {}
-      mediaStreamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      try { audioContextRef.current.close(); } catch {}
-      audioContextRef.current = null;
     }
 
     if (andSubmit) {
@@ -333,22 +300,13 @@ export default function App() {
       const totalWidth = numBars * (barWidth + gap);
       const startX = (width - totalWidth) / 2;
 
-      let freqData = null;
-      if (analyserRef.current) {
-        freqData = new Uint8Array(analyserRef.current.frequencyBinCount);
-        analyserRef.current.getByteFrequencyData(freqData);
-      }
-
       for (let i = 0; i < numBars; i++) {
         const x = startX + i * (barWidth + gap);
         let amplitude = 6;
-        if (freqData && isListening) {
-          const val = freqData[i % freqData.length];
-          amplitude = Math.max(6, (val / 255) * 36);
-        } else if (isSpeaking) {
-          amplitude = 12 + Math.sin(phase + i * 0.3) * 22 * (0.6 + Math.random() * 0.4);
+        if (isSpeaking) {
+          amplitude = 14 + Math.sin(phase + i * 0.3) * 22 * (0.6 + Math.random() * 0.4);
         } else if (isListening) {
-          amplitude = 8 + Math.cos(phase + i * 0.4) * 16 * (0.5 + Math.random() * 0.5);
+          amplitude = 12 + Math.cos(phase + i * 0.4) * 18 * (0.5 + Math.random() * 0.5);
         } else {
           amplitude = 4 + Math.sin(phase + i * 0.2) * 4;
         }
