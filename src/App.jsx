@@ -134,6 +134,9 @@ export default function App() {
   const synthRef = useRef(null);
   const canvasRef = useRef(null);
   const animationFrameRef = useRef(null);
+  const isListeningRef = useRef(false);
+  const finalTranscriptRef = useRef('');
+  const silenceTimerRef = useRef(null);
 
   // Periodic latency telemetry jitter to simulate real network metrics
   useEffect(() => {
@@ -151,12 +154,13 @@ export default function App() {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (SpeechRecognition) {
         const recognition = new SpeechRecognition();
-        recognition.continuous = false;
+        recognition.continuous = true;
         recognition.interimResults = true;
         recognition.lang = selectedPersona.lang;
 
         recognition.onstart = () => {
           setIsListening(true);
+          finalTranscriptRef.current = '';
           // If speaking, interrupt
           if (synthRef.current && synthRef.current.speaking) {
             synthRef.current.cancel();
@@ -165,23 +169,63 @@ export default function App() {
         };
 
         recognition.onresult = (event) => {
-          let current = '';
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
-            current += event.results[i][0].transcript;
+          let interim = '';
+          let final = '';
+          for (let i = 0; i < event.results.length; i++) {
+            const result = event.results[i];
+            if (result.isFinal) {
+              final += result[0].transcript + ' ';
+            } else {
+              interim += result[0].transcript;
+            }
           }
-          setTranscript(current);
-          if (event.results[0].isFinal) {
-            handleUserMessage(current);
+          
+          if (final) {
+            finalTranscriptRef.current = final.trim();
           }
+          setTranscript((finalTranscriptRef.current + ' ' + interim).trim());
+
+          // Reset silence timer on every result — send after 2s of silence
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = setTimeout(() => {
+            const fullText = finalTranscriptRef.current || interim;
+            if (fullText.trim()) {
+              // Stop listening, process the message
+              if (recognitionRef.current && isListeningRef.current) {
+                isListeningRef.current = false;
+                recognitionRef.current.stop();
+              }
+              handleUserMessage(fullText.trim());
+            }
+          }, 2000);
         };
 
         recognition.onerror = (e) => {
-          console.warn('Speech recognition error:', e);
-          setIsListening(false);
+          console.warn('Speech recognition error:', e.error);
+          if (e.error === 'no-speech' && isListeningRef.current) {
+            // No speech detected, restart
+            try { recognition.start(); } catch {}
+            return;
+          }
+          if (e.error !== 'aborted') {
+            setIsListening(false);
+            isListeningRef.current = false;
+          }
         };
 
         recognition.onend = () => {
-          setIsListening(false);
+          // Auto-restart if user hasn't explicitly stopped
+          if (isListeningRef.current) {
+            try {
+              recognition.start();
+            } catch (e) {
+              console.warn('Could not restart recognition:', e);
+              setIsListening(false);
+              isListeningRef.current = false;
+            }
+          } else {
+            setIsListening(false);
+          }
         };
 
         recognitionRef.current = recognition;
@@ -276,21 +320,30 @@ export default function App() {
 
   const handleStopSpeaking = () => {
     if (synthRef.current) synthRef.current.cancel();
-    if (recognitionRef.current && isListening) recognitionRef.current.stop();
+    if (recognitionRef.current && isListeningRef.current) {
+      isListeningRef.current = false;
+      recognitionRef.current.stop();
+    }
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     setIsSpeaking(false);
     setIsListening(false);
   };
 
   const toggleListening = () => {
-    if (isListening) {
+    if (isListeningRef.current) {
+      isListeningRef.current = false;
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (recognitionRef.current) recognitionRef.current.stop();
       setIsListening(false);
     } else {
       if (recognitionRef.current) {
         try {
+          finalTranscriptRef.current = '';
+          setTranscript('');
+          isListeningRef.current = true;
           recognitionRef.current.start();
         } catch (e) {
-          console.warn('Speech recognition restart error:', e);
+          console.warn('Speech recognition start error:', e);
         }
       } else {
         alert('Speech recognition is not supported in this browser. Please use Chrome or Edge.');
