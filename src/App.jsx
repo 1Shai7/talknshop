@@ -164,8 +164,7 @@ export default function App() {
 
         recognition.onstart = () => {
           setIsListening(true);
-          isListeningRef.current = true;
-          setMicStatusText('Listening... Speak your order clearly');
+          setMicStatusText('🎙️ Mic is ON & listening... Speak at your own pace');
           if (synthRef.current && synthRef.current.speaking) {
             synthRef.current.cancel();
             setIsSpeaking(false);
@@ -188,51 +187,41 @@ export default function App() {
           if (combined) {
             finalTranscriptRef.current = combined;
             setTranscript(combined);
-            setMicStatusText(`Hearing you: "${combined.slice(-35)}"`);
+            setMicStatusText(`Hearing you: "${combined.slice(-40)}"`);
           }
-
-          // Generous 4-second silence timeout before auto-submitting
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = setTimeout(() => {
-            if (finalTranscriptRef.current && finalTranscriptRef.current.trim().length > 2) {
-              const orderToProcess = finalTranscriptRef.current.trim();
-              finalTranscriptRef.current = '';
-              setTranscript('');
-              if (recognitionRef.current && isListeningRef.current) {
-                isListeningRef.current = false;
-                try { recognitionRef.current.stop(); } catch {}
-              }
-              handleUserMessage(orderToProcess);
-            }
-          }, 4000);
+          // Note: NO auto-stop timeout! Mic stays ON until user submits or taps mic again.
         };
 
         recognition.onerror = (e) => {
-          console.warn('Speech recognition event:', e.error);
+          console.warn('Speech recognition error:', e.error);
           if (e.error === 'no-speech') {
-            // Keep listening, do not abort
-            setMicStatusText('Still listening... say your order');
+            // Keep listening, do NOT stop
             return;
           }
           if (e.error === 'not-allowed') {
-            setMicStatusText('Microphone blocked. Please allow mic in browser address bar.');
+            setMicStatusText('Microphone blocked. Please allow mic permissions in browser.');
             setIsListening(false);
             isListeningRef.current = false;
           }
         };
 
         recognition.onend = () => {
-          // If listening is still supposed to be active, safely restart with delay
+          // If user still wants mic on, seamlessly restart!
           if (isListeningRef.current) {
             setTimeout(() => {
               if (isListeningRef.current && recognitionRef.current) {
                 try {
                   recognitionRef.current.start();
                 } catch (err) {
-                  console.log('Safe restart skipped:', err);
+                  // If browser needs a moment, retry
+                  setTimeout(() => {
+                    if (isListeningRef.current && recognitionRef.current) {
+                      try { recognitionRef.current.start(); } catch {}
+                    }
+                  }, 300);
                 }
               }
-            }, 300);
+            }, 150);
           } else {
             setIsListening(false);
             setMicStatusText('');
@@ -244,17 +233,17 @@ export default function App() {
     }
   }, [selectedPersona]);
 
-  const toggleListening = async () => {
+  const toggleListening = () => {
     if (isListeningRef.current) {
-      // User tapped to finish/stop
+      // User tapped to finish speaking & submit order
       isListeningRef.current = false;
-      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      setIsListening(false);
+      setMicStatusText('');
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch {}
       }
-      setIsListening(false);
 
-      // If user had spoken something, process it immediately!
+      // If user had spoken something, submit the order immediately!
       if (finalTranscriptRef.current && finalTranscriptRef.current.trim().length > 1) {
         const orderToProcess = finalTranscriptRef.current.trim();
         finalTranscriptRef.current = '';
@@ -262,24 +251,17 @@ export default function App() {
         handleUserMessage(orderToProcess);
       }
     } else {
-      // Prompt for mic permission first if needed
-      try {
-        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-          await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => {});
-        }
-      } catch (err) {
-        console.warn('Mic permission error:', err);
-      }
-
+      // Turn microphone ON and KEEP IT ON
       if (recognitionRef.current) {
+        finalTranscriptRef.current = '';
+        setTranscript('');
+        isListeningRef.current = true;
+        setIsListening(true);
+        setMicStatusText('Starting microphone...');
         try {
-          finalTranscriptRef.current = '';
-          setTranscript('');
-          isListeningRef.current = true;
           recognitionRef.current.start();
         } catch (e) {
-          console.warn('Speech recognition start error:', e);
-          // If already started, force restart
+          console.warn('Start error, restarting:', e);
           try {
             recognitionRef.current.stop();
             setTimeout(() => {
@@ -294,14 +276,14 @@ export default function App() {
   };
 
   const submitCurrentTranscript = () => {
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     const textToSubmit = finalTranscriptRef.current || transcript || inputText;
     if (textToSubmit.trim()) {
       isListeningRef.current = false;
+      setIsListening(false);
+      setMicStatusText('');
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch {}
       }
-      setIsListening(false);
       finalTranscriptRef.current = '';
       setTranscript('');
       setInputText('');
@@ -564,9 +546,10 @@ export default function App() {
             {/* Microphone Activation Button */}
             <button
               onClick={toggleListening}
-              className={`w-20 h-20 rounded-full flex items-center justify-center transition-all duration-300 shadow-2xl active:scale-95 ${
+              title={isListening ? "Click to finish and submit order" : "Click to speak order"}
+              className={`w-20 h-20 rounded-full flex items-center justify-center transition-all duration-300 shadow-2xl active:scale-95 cursor-pointer ${
                 isListening
-                  ? 'bg-emerald-500 text-white ring-8 ring-emerald-500/20 shadow-emerald-500/50 scale-105'
+                  ? 'bg-emerald-500 text-white ring-8 ring-emerald-500/30 shadow-emerald-500/60 scale-110 animate-pulse'
                   : isSpeaking
                   ? 'bg-gradient-to-tr from-purple-600 to-indigo-600 text-white ring-8 ring-purple-500/20 shadow-purple-500/40'
                   : 'bg-slate-800/90 text-slate-300 hover:text-white hover:bg-slate-700/90 ring-4 ring-white/5'
@@ -578,6 +561,16 @@ export default function App() {
                 <Mic className="w-8 h-8" />
               )}
             </button>
+
+            {isListening && (
+              <button
+                onClick={toggleListening}
+                className="mt-3 px-4 py-1.5 rounded-full bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/40 text-emerald-300 text-xs font-semibold flex items-center gap-1.5 transition-all animate-pulse cursor-pointer shadow-lg"
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                Tap when finished speaking
+              </button>
+            )}
           </div>
         </div>
 
