@@ -106,6 +106,7 @@ export default function App() {
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [transcript, setTranscript] = useState('');
   const [inputText, setInputText] = useState('');
   const [micStatusText, setMicStatusText] = useState('');
   const [micMode, setMicMode] = useState('toggle'); // 'toggle' or 'hold'
