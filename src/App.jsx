@@ -134,12 +134,15 @@ export default function App() {
 
   // Audio & recognition refs
   const recognitionRef = useRef(null);
+  const recognitionInstanceRef = useRef(null);
   const synthRef = useRef(null);
   const canvasRef = useRef(null);
   const animationFrameRef = useRef(null);
   const isListeningRef = useRef(false);
   const finalTranscriptRef = useRef('');
-  const silenceTimerRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const mediaStreamRef = useRef(null);
 
   // Periodic latency telemetry jitter to simulate real network metrics
   useEffect(() => {
@@ -150,145 +153,165 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Initialize Web Speech Recognition
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      synthRef.current = window.speechSynthesis;
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SpeechRecognition) {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.maxAlternatives = 1;
-        recognition.lang = selectedPersona.lang;
+  // Start microphone listening session with fresh SpeechRecognition instance & real audio meter
+  const startListeningSession = () => {
+    const SpeechRecognition = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
 
-        recognition.onstart = () => {
-          setIsListening(true);
-          setMicStatusText('🎙️ Mic is ON & listening... Speak at your own pace');
-          if (synthRef.current && synthRef.current.speaking) {
-            synthRef.current.cancel();
-            setIsSpeaking(false);
-          }
-        };
-
-        recognition.onresult = (event) => {
-          let interim = '';
-          let final = '';
-          for (let i = 0; i < event.results.length; i++) {
-            const result = event.results[i];
-            if (result.isFinal) {
-              final += result[0].transcript + ' ';
-            } else {
-              interim += result[0].transcript;
-            }
-          }
-
-          const combined = (final + interim).trim();
-          if (combined) {
-            finalTranscriptRef.current = combined;
-            setTranscript(combined);
-            setMicStatusText(`Hearing you: "${combined.slice(-40)}"`);
-          }
-          // Note: NO auto-stop timeout! Mic stays ON until user submits or taps mic again.
-        };
-
-        recognition.onerror = (e) => {
-          console.warn('Speech recognition error:', e.error);
-          if (e.error === 'no-speech') {
-            // Keep listening, do NOT stop
-            return;
-          }
-          if (e.error === 'not-allowed') {
-            setMicStatusText('Microphone blocked. Please allow mic permissions in browser.');
-            setIsListening(false);
-            isListeningRef.current = false;
-          }
-        };
-
-        recognition.onend = () => {
-          // If user still wants mic on, seamlessly restart!
-          if (isListeningRef.current) {
-            setTimeout(() => {
-              if (isListeningRef.current && recognitionRef.current) {
-                try {
-                  recognitionRef.current.start();
-                } catch (err) {
-                  // If browser needs a moment, retry
-                  setTimeout(() => {
-                    if (isListeningRef.current && recognitionRef.current) {
-                      try { recognitionRef.current.start(); } catch {}
-                    }
-                  }, 300);
-                }
-              }
-            }, 150);
-          } else {
-            setIsListening(false);
-            setMicStatusText('');
-          }
-        };
-
-        recognitionRef.current = recognition;
-      }
-    }
-  }, [selectedPersona]);
-
-  const toggleListening = () => {
-    if (isListeningRef.current) {
-      // User tapped to finish speaking & submit order
-      isListeningRef.current = false;
-      setIsListening(false);
-      setMicStatusText('');
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop(); } catch {}
-      }
-
-      // If user had spoken something, submit the order immediately!
-      if (finalTranscriptRef.current && finalTranscriptRef.current.trim().length > 1) {
-        const orderToProcess = finalTranscriptRef.current.trim();
-        finalTranscriptRef.current = '';
-        setTranscript('');
-        handleUserMessage(orderToProcess);
-      }
-    } else {
-      // Turn microphone ON and KEEP IT ON
-      if (recognitionRef.current) {
-        finalTranscriptRef.current = '';
-        setTranscript('');
-        isListeningRef.current = true;
-        setIsListening(true);
-        setMicStatusText('Starting microphone...');
+    // 1. Hook real Web Audio API for responsive visualizer
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        mediaStreamRef.current = stream;
         try {
-          recognitionRef.current.start();
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          if (AudioContext) {
+            const ctx = new AudioContext();
+            audioContextRef.current = ctx;
+            const source = ctx.createMediaStreamSource(stream);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 64;
+            source.connect(analyser);
+            analyserRef.current = analyser;
+          }
         } catch (e) {
-          console.warn('Start error, restarting:', e);
-          try {
-            recognitionRef.current.stop();
-            setTimeout(() => {
-              if (isListeningRef.current) recognitionRef.current.start();
-            }, 200);
-          } catch {}
+          console.warn('AudioContext error:', e);
         }
-      } else {
-        alert('Speech recognition is not supported in this browser. Please use Chrome or Edge.');
+      }).catch(err => {
+        console.warn('Microphone permission check:', err);
+      });
+    }
+
+    if (!SpeechRecognition) {
+      setIsListening(true);
+      isListeningRef.current = true;
+      setMicStatusText('🎙️ Microphone active. Speech API unavailable in this browser; you can also type below.');
+      return;
+    }
+
+    // Stop any existing instance cleanly
+    if (recognitionInstanceRef.current) {
+      try { recognitionInstanceRef.current.abort(); } catch {}
+      recognitionInstanceRef.current = null;
+    }
+
+    // Create fresh instance each time to prevent Chromium dead-instance bug
+    try {
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+      rec.lang = selectedPersona.lang;
+
+      rec.onstart = () => {
+        setIsListening(true);
+        isListeningRef.current = true;
+        setMicStatusText('🎙️ Listening... Speak your order clearly');
+        if (synthRef.current && synthRef.current.speaking) {
+          synthRef.current.cancel();
+          setIsSpeaking(false);
+        }
+      };
+
+      rec.onresult = (event) => {
+        let interim = '';
+        let final = '';
+        for (let i = 0; i < event.results.length; i++) {
+          const result = event.results[i];
+          if (result.isFinal) {
+            final += result[0].transcript + ' ';
+          } else {
+            interim += result[0].transcript;
+          }
+        }
+
+        const combined = (final + interim).trim();
+        if (combined) {
+          finalTranscriptRef.current = combined;
+          setTranscript(combined);
+          setMicStatusText(`Hearing: "${combined.slice(-40)}"`);
+        }
+      };
+
+      rec.onerror = (e) => {
+        console.warn('SpeechRecognition error:', e.error);
+        if (e.error === 'no-speech') return;
+        if (e.error === 'not-allowed') {
+          setMicStatusText('⚠️ Mic blocked. Click lock/mic icon in browser URL bar to allow.');
+          setIsListening(false);
+          isListeningRef.current = false;
+          return;
+        }
+        // Auto-reconnect if temporary disconnect
+        if (isListeningRef.current && (e.error === 'network' || e.error === 'aborted')) {
+          setTimeout(() => {
+            if (isListeningRef.current) startListeningSession();
+          }, 300);
+        }
+      };
+
+      rec.onend = () => {
+        // If user is still recording, auto-respawn fresh instance immediately
+        if (isListeningRef.current) {
+          setTimeout(() => {
+            if (isListeningRef.current) startListeningSession();
+          }, 200);
+        } else {
+          setIsListening(false);
+          setMicStatusText('');
+        }
+      };
+
+      rec.start();
+      recognitionInstanceRef.current = rec;
+    } catch (err) {
+      console.warn('Recognition start exception:', err);
+    }
+  };
+
+  const stopListeningSession = (andSubmit = true) => {
+    isListeningRef.current = false;
+    setIsListening(false);
+    setMicStatusText('');
+
+    if (recognitionInstanceRef.current) {
+      try { recognitionInstanceRef.current.stop(); } catch {}
+      recognitionInstanceRef.current = null;
+    }
+
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      } catch {}
+      mediaStreamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      try { audioContextRef.current.close(); } catch {}
+      audioContextRef.current = null;
+    }
+
+    if (andSubmit) {
+      const textToProcess = finalTranscriptRef.current || transcript || inputText;
+      if (textToProcess && textToProcess.trim().length > 1) {
+        const order = textToProcess.trim();
+        finalTranscriptRef.current = '';
+        setTranscript('');
+        setInputText('');
+        handleUserMessage(order);
       }
     }
   };
 
-  const submitCurrentTranscript = () => {
-    const textToSubmit = finalTranscriptRef.current || transcript || inputText;
-    if (textToSubmit.trim()) {
-      isListeningRef.current = false;
-      setIsListening(false);
-      setMicStatusText('');
-      if (recognitionRef.current) {
-        try { recognitionRef.current.stop(); } catch {}
-      }
+  const toggleListening = () => {
+    if (isListeningRef.current) {
+      stopListeningSession(true);
+    } else {
       finalTranscriptRef.current = '';
       setTranscript('');
-      setInputText('');
-      handleUserMessage(textToSubmit.trim());
+      startListeningSession();
     }
+  };
+
+  const submitCurrentTranscript = () => {
+    stopListeningSession(true);
   };
 
   // Canvas waveform visualizer animation
@@ -310,10 +333,19 @@ export default function App() {
       const totalWidth = numBars * (barWidth + gap);
       const startX = (width - totalWidth) / 2;
 
+      let freqData = null;
+      if (analyserRef.current) {
+        freqData = new Uint8Array(analyserRef.current.frequencyBinCount);
+        analyserRef.current.getByteFrequencyData(freqData);
+      }
+
       for (let i = 0; i < numBars; i++) {
         const x = startX + i * (barWidth + gap);
         let amplitude = 6;
-        if (isSpeaking) {
+        if (freqData && isListening) {
+          const val = freqData[i % freqData.length];
+          amplitude = Math.max(6, (val / 255) * 36);
+        } else if (isSpeaking) {
           amplitude = 12 + Math.sin(phase + i * 0.3) * 22 * (0.6 + Math.random() * 0.4);
         } else if (isListening) {
           amplitude = 8 + Math.cos(phase + i * 0.4) * 16 * (0.5 + Math.random() * 0.5);
@@ -619,6 +651,25 @@ export default function App() {
           >
             Order
           </button>
+        </div>
+
+        {/* Quick Demo Order Shortcuts */}
+        <div className="flex flex-wrap items-center justify-center gap-1.5 mt-3 max-w-md px-4">
+          <span className="text-[10px] uppercase font-mono tracking-wider text-slate-500 mr-1">Quick Orders:</span>
+          {[
+            { label: '☕ 2 Iced Lattes', prompt: 'I want 2 iced caramel lattes with oat milk' },
+            { label: '🍔 Double Burger & Fries', prompt: 'Order a double cheeseburger with large fries' },
+            { label: '🍕 Pepperoni Pizza', prompt: 'I want a large pepperoni pizza and a coke' },
+            { label: '✈️ Tokyo Business Flight', prompt: 'Book executive flight to Tokyo with 5-star hotel' }
+          ].map((item, i) => (
+            <button
+              key={i}
+              onClick={() => handleUserMessage(item.prompt)}
+              className="px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-indigo-600/40 border border-white/10 hover:border-indigo-400/50 text-slate-300 hover:text-white text-[11px] font-medium transition-all cursor-pointer shadow-sm active:scale-95"
+            >
+              {item.label}
+            </button>
+          ))}
         </div>
 
         {/* Primary Controls Bar */}
