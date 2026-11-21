@@ -106,7 +106,9 @@ export default function App() {
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [transcript, setTranscript] = useState('');
+  const [inputText, setInputText] = useState('');
+  const [micStatusText, setMicStatusText] = useState('');
+  const [micMode, setMicMode] = useState('toggle'); // 'toggle' or 'hold'
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
@@ -156,12 +158,13 @@ export default function App() {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
         recognition.interimResults = true;
+        recognition.maxAlternatives = 1;
         recognition.lang = selectedPersona.lang;
 
         recognition.onstart = () => {
           setIsListening(true);
-          finalTranscriptRef.current = '';
-          // If speaking, interrupt
+          isListeningRef.current = true;
+          setMicStatusText('Listening... Speak your order clearly');
           if (synthRef.current && synthRef.current.speaking) {
             synthRef.current.cancel();
             setIsSpeaking(false);
@@ -179,52 +182,59 @@ export default function App() {
               interim += result[0].transcript;
             }
           }
-          
-          if (final) {
-            finalTranscriptRef.current = final.trim();
-          }
-          setTranscript((finalTranscriptRef.current + ' ' + interim).trim());
 
-          // Reset silence timer on every result — send after 2s of silence
+          const combined = (final + interim).trim();
+          if (combined) {
+            finalTranscriptRef.current = combined;
+            setTranscript(combined);
+            setMicStatusText(`Hearing you: "${combined.slice(-35)}"`);
+          }
+
+          // Generous 4-second silence timeout before auto-submitting
           if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
           silenceTimerRef.current = setTimeout(() => {
-            const fullText = finalTranscriptRef.current || interim;
-            if (fullText.trim()) {
-              // Stop listening, process the message
+            if (finalTranscriptRef.current && finalTranscriptRef.current.trim().length > 2) {
+              const orderToProcess = finalTranscriptRef.current.trim();
+              finalTranscriptRef.current = '';
+              setTranscript('');
               if (recognitionRef.current && isListeningRef.current) {
                 isListeningRef.current = false;
-                recognitionRef.current.stop();
+                try { recognitionRef.current.stop(); } catch {}
               }
-              handleUserMessage(fullText.trim());
+              handleUserMessage(orderToProcess);
             }
-          }, 2000);
+          }, 4000);
         };
 
         recognition.onerror = (e) => {
-          console.warn('Speech recognition error:', e.error);
-          if (e.error === 'no-speech' && isListeningRef.current) {
-            // No speech detected, restart
-            try { recognition.start(); } catch {}
+          console.warn('Speech recognition event:', e.error);
+          if (e.error === 'no-speech') {
+            // Keep listening, do not abort
+            setMicStatusText('Still listening... say your order');
             return;
           }
-          if (e.error !== 'aborted') {
+          if (e.error === 'not-allowed') {
+            setMicStatusText('Microphone blocked. Please allow mic in browser address bar.');
             setIsListening(false);
             isListeningRef.current = false;
           }
         };
 
         recognition.onend = () => {
-          // Auto-restart if user hasn't explicitly stopped
+          // If listening is still supposed to be active, safely restart with delay
           if (isListeningRef.current) {
-            try {
-              recognition.start();
-            } catch (e) {
-              console.warn('Could not restart recognition:', e);
-              setIsListening(false);
-              isListeningRef.current = false;
-            }
+            setTimeout(() => {
+              if (isListeningRef.current && recognitionRef.current) {
+                try {
+                  recognitionRef.current.start();
+                } catch (err) {
+                  console.log('Safe restart skipped:', err);
+                }
+              }
+            }, 300);
           } else {
             setIsListening(false);
+            setMicStatusText('');
           }
         };
 
@@ -232,6 +242,71 @@ export default function App() {
       }
     }
   }, [selectedPersona]);
+
+  const toggleListening = async () => {
+    if (isListeningRef.current) {
+      // User tapped to finish/stop
+      isListeningRef.current = false;
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch {}
+      }
+      setIsListening(false);
+
+      // If user had spoken something, process it immediately!
+      if (finalTranscriptRef.current && finalTranscriptRef.current.trim().length > 1) {
+        const orderToProcess = finalTranscriptRef.current.trim();
+        finalTranscriptRef.current = '';
+        setTranscript('');
+        handleUserMessage(orderToProcess);
+      }
+    } else {
+      // Prompt for mic permission first if needed
+      try {
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => {});
+        }
+      } catch (err) {
+        console.warn('Mic permission error:', err);
+      }
+
+      if (recognitionRef.current) {
+        try {
+          finalTranscriptRef.current = '';
+          setTranscript('');
+          isListeningRef.current = true;
+          recognitionRef.current.start();
+        } catch (e) {
+          console.warn('Speech recognition start error:', e);
+          // If already started, force restart
+          try {
+            recognitionRef.current.stop();
+            setTimeout(() => {
+              if (isListeningRef.current) recognitionRef.current.start();
+            }, 200);
+          } catch {}
+        }
+      } else {
+        alert('Speech recognition is not supported in this browser. Please use Chrome or Edge.');
+      }
+    }
+  };
+
+  const submitCurrentTranscript = () => {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    const textToSubmit = finalTranscriptRef.current || transcript || inputText;
+    if (textToSubmit.trim()) {
+      isListeningRef.current = false;
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch {}
+      }
+      setIsListening(false);
+      finalTranscriptRef.current = '';
+      setTranscript('');
+      setInputText('');
+      handleUserMessage(textToSubmit.trim());
+    }
+  };
 
   // Canvas waveform visualizer animation
   useEffect(() => {
@@ -329,27 +404,6 @@ export default function App() {
     setIsListening(false);
   };
 
-  const toggleListening = () => {
-    if (isListeningRef.current) {
-      isListeningRef.current = false;
-      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      if (recognitionRef.current) recognitionRef.current.stop();
-      setIsListening(false);
-    } else {
-      if (recognitionRef.current) {
-        try {
-          finalTranscriptRef.current = '';
-          setTranscript('');
-          isListeningRef.current = true;
-          recognitionRef.current.start();
-        } catch (e) {
-          console.warn('Speech recognition start error:', e);
-        }
-      } else {
-        alert('Speech recognition is not supported in this browser. Please use Chrome or Edge.');
-      }
-    }
-  };
 
   const handleUserMessage = (text) => {
     if (!text.trim()) return;
@@ -357,12 +411,18 @@ export default function App() {
     const newMsg = { role: 'user', text };
     setMessages(prev => [...prev, newMsg]);
     setTranscript('');
+    setInputText('');
 
     // Simulate smart Falcon response
     setTimeout(() => {
-      let reply = `Understood. Processing "${text}" with Murf Falcon 2.1 voice stream.`;
+      let reply = `Order confirmed! I have placed your request for "${text}". Your confirmation code is #AG-${Math.floor(1000 + Math.random() * 9000)}.`;
       const lower = text.toLowerCase();
-      if (lower.includes('tokyo') || lower.includes('travel')) {
+
+      if (lower.includes('coffee') || lower.includes('latte') || lower.includes('tea') || lower.includes('drink')) {
+        reply = `Got it! Order received: ${text}. Total is $4.50. Barista has received your ticket, estimated pickup in 5 minutes!`;
+      } else if (lower.includes('burger') || lower.includes('pizza') || lower.includes('food') || lower.includes('fries') || lower.includes('eat')) {
+        reply = `Delicious choice! Your order for "${text}" is sent to the kitchen. Order #AG-${Math.floor(1000 + Math.random() * 9000)} is estimated in 12 minutes.`;
+      } else if (lower.includes('tokyo') || lower.includes('travel') || lower.includes('flight')) {
         reply = "I've locked in your Tokyo executive itinerary: First class direct to Haneda, private transfer to Aman Tokyo, and Shinkansen Gran Class to Kyoto booked.";
       } else if (lower.includes('trend') || lower.includes('ai')) {
         reply = "Key 2026 trends: sub-100ms time-to-first-audio TTS, WebRTC transport convergence, and dynamic emotional timbre modulation for voice agents.";
@@ -523,19 +583,49 @@ export default function App() {
         {/* Caption Instructions */}
         <p className="text-sm md:text-base text-slate-400 font-medium text-center mt-3 max-w-lg">
           {isListening ? (
-            <span className="text-emerald-400 font-semibold animate-pulse">Listening... Speak now</span>
+            <span className="text-emerald-400 font-semibold animate-pulse">
+              🎙️ {micStatusText || 'Listening... Speak your order, then tap mic or click Send'}
+            </span>
           ) : isSpeaking ? (
-            <span className="text-purple-300 font-semibold">{selectedPersona.voice} is streaming speech...</span>
+            <span className="text-purple-300 font-semibold">{selectedPersona.voice} is speaking...</span>
           ) : (
-            'Tap the mic to speak via Web Speech + Murf Falcon TTS, or use the smart prompts below.'
+            'Tap mic to speak your order, or type below.'
           )}
         </p>
 
+        {/* Live Transcript & Instant Submit Button */}
         {transcript && (
-          <div className="mt-3 px-4 py-2 rounded-xl bg-slate-800/80 border border-slate-700/50 text-slate-200 text-sm italic max-w-md text-center">
-            "{transcript}"
+          <div className="mt-3 flex flex-col items-center gap-2 max-w-md w-full px-4 animate-in fade-in">
+            <div className="w-full px-4 py-2.5 rounded-xl bg-slate-800/90 border border-emerald-500/40 text-slate-100 text-sm italic text-center shadow-lg">
+              "{transcript}"
+            </div>
+            <button
+              onClick={submitCurrentTranscript}
+              className="px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white font-semibold text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/30 transition-all active:scale-95 cursor-pointer"
+            >
+              <Check className="w-4 h-4" /> Send This Order
+            </button>
           </div>
         )}
+
+        {/* Direct Text Order Input Box (Type or Speak) */}
+        <div className="w-full max-w-md mt-4 flex items-center gap-2 px-4">
+          <input
+            type="text"
+            value={inputText}
+            onChange={(e) => setInputText(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') submitCurrentTranscript(); }}
+            placeholder="Type your order here (e.g. 2 lattes)..."
+            className="flex-1 bg-slate-900/90 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium"
+          />
+          <button
+            onClick={submitCurrentTranscript}
+            disabled={!inputText.trim()}
+            className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:hover:bg-indigo-600 text-white text-xs font-semibold flex items-center gap-1.5 transition-all shadow-md active:scale-95 cursor-pointer"
+          >
+            Order
+          </button>
+        </div>
 
         {/* Primary Controls Bar */}
         <div className="w-full max-w-2xl mt-8 grid grid-cols-1 md:grid-cols-2 gap-4">
